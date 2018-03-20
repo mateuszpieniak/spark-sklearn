@@ -11,15 +11,20 @@ from scipy.stats import rankdata
 
 from sklearn.base import BaseEstimator, is_classifier, clone
 from sklearn.metrics.scorer import check_scoring
-from sklearn.model_selection import KFold, check_cv, ParameterGrid
+from sklearn.model_selection import KFold, check_cv, ParameterGrid, ParameterSampler
 from sklearn.model_selection._validation import _fit_and_score
-from sklearn.model_selection._search import BaseSearchCV, _check_param_grid, _CVScoreTuple
+from sklearn.model_selection._search import BaseSearchCV, _check_param_grid, \
+    _CVScoreTuple
 from sklearn.utils.fixes import MaskedArray
 from sklearn.utils.metaestimators import _safe_split
 from sklearn.utils.validation import _num_samples, indexable
 
+from abc import ABCMeta, abstractmethod
 
-class GridSearchCV(BaseSearchCV):
+
+class SparkBaseSearchCV(BaseSearchCV):
+    __metaclass__ = ABCMeta
+
     """Exhaustive search over specified parameter values for an estimator.
     
     Important members are fit, predict.
@@ -236,24 +241,30 @@ class GridSearchCV(BaseSearchCV):
     
     """
 
-
-    def __init__(self, sc, estimator, param_grid, scoring=None, fit_params=None,
+    def __init__(self, sc, estimator, params, scoring=None, fit_params=None,
                  n_jobs=1, iid=True, refit=True, cv=None, verbose=0,
-                 pre_dispatch='2*n_jobs', error_score='raise', return_train_score=True):
-        super(GridSearchCV, self).__init__(
-            estimator=estimator, scoring=scoring, n_jobs=n_jobs, iid=iid,
-            refit=refit, cv=cv, verbose=verbose, pre_dispatch=pre_dispatch, error_score=error_score,
-            return_train_score=return_train_score)
+                 pre_dispatch='2*n_jobs', error_score='raise',
+                 return_train_score=True):
+        super(SparkBaseSearchCV, self).__init__(
+            estimator=estimator,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            iid=iid,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score
+        )
 
         self.fit_params = fit_params if fit_params is not None else {}
-
         self.sc = sc
-        self.param_grid = param_grid
-
+        self.params = params
         self.cv_results_ = None
-        _check_param_grid(param_grid)
-    
-    def fit(self, X, y=None, groups=None):
+
+    @abstractmethod
+    def fit(self, X, y=None, groups=None, **fit_params):
         """Run fit with all sets of parameters.
         
         Parameters
@@ -271,7 +282,7 @@ class GridSearchCV(BaseSearchCV):
             Group labels for the samples used while splitting the dataset into
             train/test set.
         """
-        return self._fit(X, y, groups, ParameterGrid(self.param_grid))
+        pass
 
     def _fit(self, X, y, groups, parameter_iterable):
 
@@ -282,7 +293,7 @@ class GridSearchCV(BaseSearchCV):
 
         X, y, groups = indexable(X, y, groups)
         n_splits = cv.get_n_splits(X, y, groups)
-        
+
         if self.verbose > 0 and isinstance(parameter_iterable, Sized):
             n_candidates = len(parameter_iterable)
             print("Fitting {0} folds for each of {1} candidates, totalling"
@@ -291,12 +302,14 @@ class GridSearchCV(BaseSearchCV):
 
         base_estimator = clone(self.estimator)
 
-        param_grid = [(parameters, train, test) for parameters in parameter_iterable
-                                                for train, test in list(cv.split(X, y, groups))]
+        param_grid = [(parameters, train, test) for parameters in
+            parameter_iterable
+            for train, test in list(cv.split(X, y, groups))]
         # Because the original python code expects a certain order for the elements, we need to
         # respect it.
         indexed_param_grid = list(zip(range(len(param_grid)), param_grid))
-        par_param_grid = self.sc.parallelize(indexed_param_grid, len(indexed_param_grid))
+        par_param_grid = self.sc.parallelize(indexed_param_grid,
+                                             len(indexed_param_grid))
         X_bc = self.sc.broadcast(X)
         y_bc = self.sc.broadcast(y)
 
@@ -312,19 +325,22 @@ class GridSearchCV(BaseSearchCV):
             local_estimator = clone(base_estimator)
             local_X = X_bc.value
             local_y = y_bc.value
-            res = fas(local_estimator, local_X, local_y, scorer, train, test, verbose,
+            res = fas(local_estimator, local_X, local_y, scorer, train, test,
+                      verbose,
                       parameters, fit_params,
                       return_train_score=return_train_score,
                       return_n_test_samples=True, return_times=True,
                       return_parameters=True, error_score=error_score)
             return (index, res)
+
         indexed_out0 = dict(par_param_grid.map(fun).collect())
         out = [indexed_out0[idx] for idx in range(len(param_grid))]
         if return_train_score:
             (train_scores, test_scores, test_sample_counts, fit_time,
-             score_time, parameters) = zip(*out)
+            score_time, parameters) = zip(*out)
         else:
-            (test_scores, test_sample_counts, fit_time, score_time, parameters) = zip(*out)
+            (test_scores, test_sample_counts, fit_time, score_time,
+            parameters) = zip(*out)
         X_bc.unpersist()
         y_bc.unpersist()
 
@@ -374,7 +390,7 @@ class GridSearchCV(BaseSearchCV):
         # applicable for that candidate. Use defaultdict as each candidate may
         # not contain all the params
         param_results = defaultdict(partial(MaskedArray,
-                                            np.empty(n_candidates,),
+                                            np.empty(n_candidates, ),
                                             mask=True,
                                             dtype=object))
         for cand_i, params in enumerate(candidate_params):
@@ -404,3 +420,65 @@ class GridSearchCV(BaseSearchCV):
                 best_estimator.fit(X, **fit_params)
             self.best_estimator_ = best_estimator
         return self
+
+
+class GridSearchCV(SparkBaseSearchCV):
+    def __init__(self, sc, estimator, params, scoring=None, fit_params=None,
+                 n_jobs=1, iid=True, refit=True, cv=None, verbose=0,
+                 pre_dispatch='2*n_jobs', error_score='raise',
+                 return_train_score=True):
+        super(GridSearchCV, self).__init__(
+            sc=sc,
+            params=params,
+            estimator=estimator,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            iid=iid,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score
+        )
+
+    def fit(self, X, y=None, groups=None, **fit_params):
+        return self._fit(X, y, groups, ParameterGrid(self.params))
+
+
+class RandomizedSearchCV(SparkBaseSearchCV):
+    def __init__(self, sc, estimator, params, n_iter, random_state,
+                 scoring=None, fit_params=None, n_jobs=1, iid=True,
+                 refit=True, cv=None, verbose=0,
+                 pre_dispatch='2*n_jobs', error_score='raise',
+                 return_train_score=True):
+        self.n_iter = n_iter
+        self.random_state = random_state
+        super(RandomizedSearchCV, self).__init__(
+            estimator=estimator,
+            params=params,
+            sc=sc,
+            scoring=scoring,
+            fit_params=fit_params,
+            n_jobs=n_jobs,
+            iid=iid,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score
+        )
+
+    def fit(self, X, y=None, groups=None, **fit_params):
+        return self._fit(
+            X=X,
+            y=y,
+            groups=groups,
+            parameter_iterable=ParameterSampler(
+                self.params,
+                self.n_iter,
+                self.random_state)
+        )
+
+
